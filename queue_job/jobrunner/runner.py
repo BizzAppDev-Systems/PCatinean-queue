@@ -284,6 +284,24 @@ class Database(object):
             pass
         self.conn = None
 
+    def _get_db_jobrunners_leader(self):
+        """Get the leader uuid of the jobrunner of the database"""
+        if not self.jobrunner_ha_uuid:
+            return ""
+        with closing(self.conn.cursor()) as cr:
+            cr.execute(
+                """
+                SELECT substring(application_name FROM 'jobrunner_(.*)')
+                FROM pg_stat_activity
+                WHERE application_name LIKE 'jobrunner_%%' AND
+                datname = %s
+                ORDER BY backend_start, datname
+                LIMIT 1;""",
+                (self.db_name,),
+            )
+            result = cr.fetchone()
+        return result[0] if result else ""
+
     def _check_leader(self, jobrunner_db_names):
         """Check if the linked jobrunner is the leader of all jobrunner_db_names"""
         if not self.jobrunner_ha_uuid:
@@ -571,6 +589,24 @@ class QueueJobRunner(object):
         # wakeup the select() in wait_notification
         os.write(self._stop_pipe[1], b".")
 
+    def check_db_multiple_jobrunners(self):
+        """Check if any database have multiple 'jobrunner_' connections as leader"""
+        expected_leader_uuid = False
+        for db_name, db_obj in self.db_by_name.items():
+            db_leader_uuid = db_obj._get_db_jobrunners_leader()
+            if not db_leader_uuid:
+                # TODO Remove me after testing
+                _logger.info("Database '%s' has no jobrunner configured.", db_name)
+                continue
+            if not expected_leader_uuid:
+                expected_leader_uuid = db_leader_uuid
+            elif expected_leader_uuid != db_leader_uuid:
+                _logger.warning(
+                    "Database '%s' has multiple jobrunners configured. "
+                    "This might impact other databases from this jobrunner.",
+                    db_name,
+                )
+
     def check_db_leader(self):
         """Check if the current jobrunner is the leader for all configured databases"""
         jobrunner_db_names = tuple(self.db_by_name.keys())
@@ -591,6 +627,11 @@ class QueueJobRunner(object):
                 # TODO: how to detect new databases or databases
                 #       on which queue_job is installed after server start?
                 self.initialize_databases()
+
+                # check if any database has multiple jobrunners configured
+                if self.uuid:
+                    self.check_db_multiple_jobrunners()
+
                 while not self._stop and self.uuid:
                     leader = self.check_db_leader()
                     if leader:
